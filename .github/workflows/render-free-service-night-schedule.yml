@@ -1,0 +1,129 @@
+name: Render Free Service Night Schedule
+
+on:
+  schedule:
+    # 1:00 AM IST = 19:30 UTC (previous day)
+    - cron: "30 19 * * *"
+    # 5:00 AM IST = 23:30 UTC (previous day)
+    - cron: "30 23 * * *"
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "Choose status for a safe test, or manually suspend/resume both services"
+        required: true
+        type: choice
+        default: status
+        options:
+          - status
+          - suspend
+          - resume
+
+permissions:
+  contents: read
+
+concurrency:
+  group: render-free-service-night-schedule
+  cancel-in-progress: false
+
+jobs:
+  manage-render-services:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Suspend at 1 AM IST, resume at 5 AM IST, or test status
+        shell: bash
+        env:
+          RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SCHEDULE: ${{ github.event.schedule || '' }}
+          MANUAL_ACTION: ${{ inputs.action || 'status' }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${RENDER_API_KEY:-}" ]]; then
+            echo "::error::Missing repository Actions secret RENDER_API_KEY."
+            echo "Add it under Settings > Secrets and variables > Actions, then run this workflow manually with action=status."
+            exit 1
+          fi
+
+          SERVICE_IDS=(
+            "srv-d8al8hf7f7vs73d92p9g"  # OMDBMovieExplorer
+            "srv-d82r34g3kofs73d3ib1g"  # Yatharth-FoodFinder
+          )
+
+          if [[ "$EVENT_NAME" == "schedule" ]]; then
+            case "$EVENT_SCHEDULE" in
+              "30 19 * * *") ACTION="suspend" ;;
+              "30 23 * * *") ACTION="resume" ;;
+              *)
+                echo "::error::Unexpected scheduled time: $EVENT_SCHEDULE"
+                exit 1
+                ;;
+            esac
+          else
+            ACTION="$MANUAL_ACTION"
+          fi
+
+          echo "Requested operation: $ACTION"
+
+          if [[ "$ACTION" == "status" ]]; then
+            for id in "${SERVICE_IDS[@]}"; do
+              body="$(curl --fail --silent --show-error \
+                --header "Authorization: Bearer $RENDER_API_KEY" \
+                --header "Accept: application/json" \
+                "https://api.render.com/v1/services/$id")"
+              name="$(jq -r '.name // .service.name // empty' <<< "$body")"
+              state="$(jq -r '.suspended // .service.suspended // "unknown"' <<< "$body")"
+              printf 'Service: %s | ID: %s | suspended: %s\n' "${name:-unknown}" "$id" "$state"
+            done
+            echo "Status check succeeded. No service state was changed."
+            exit 0
+          fi
+
+          if [[ "$ACTION" != "suspend" && "$ACTION" != "resume" ]]; then
+            echo "::error::Unsupported operation: $ACTION"
+            exit 1
+          fi
+
+          ROLLBACK_ACTION="suspend"
+          if [[ "$ACTION" == "suspend" ]]; then
+            ROLLBACK_ACTION="resume"
+          fi
+
+          changed=()
+          failed=0
+          for id in "${SERVICE_IDS[@]}"; do
+            response_file="$(mktemp)"
+            http_code="$(curl --silent --show-error \
+              --output "$response_file" --write-out '%{http_code}' \
+              --request POST \
+              --header "Authorization: Bearer $RENDER_API_KEY" \
+              --header "Accept: application/json" \
+              "https://api.render.com/v1/services/$id/$ACTION" || true)"
+
+            if [[ "$http_code" == "202" ]]; then
+              echo "$ACTION accepted for service $id (HTTP $http_code)."
+              changed+=("$id")
+            else
+              echo "::error::Render API $ACTION failed for $id (HTTP $http_code)."
+              cat "$response_file"
+              echo
+              failed=1
+            fi
+            rm -f "$response_file"
+          done
+
+          if [[ "$failed" -ne 0 ]]; then
+            echo "::warning::At least one operation failed. Attempting to roll back successful operations."
+            for id in "${changed[@]}"; do
+              rollback_code="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+                --request POST \
+                --header "Authorization: Bearer $RENDER_API_KEY" \
+                --header "Accept: application/json" \
+                "https://api.render.com/v1/services/$id/$ROLLBACK_ACTION" || true)"
+              echo "Rollback $ROLLBACK_ACTION for $id returned HTTP $rollback_code."
+            done
+            exit 1
+          fi
+
+          echo "All requested Render API operations were accepted."
