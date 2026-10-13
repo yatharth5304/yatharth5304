@@ -6,15 +6,18 @@ on:
     - cron: "30 19 * * *"
     # 5:00 AM IST = 23:30 UTC (previous day)
     - cron: "30 23 * * *"
+    # Ping every 30 minutes at local :07 and :37; skip the 1 AM-5 AM IST window.
+    - cron: "7,37 * * * *"
   workflow_dispatch:
     inputs:
       action:
-        description: "Choose status for a safe test, or manually suspend/resume both services"
+        description: "Choose status for a safe test, or manually suspend/resume/ping both services"
         required: true
         type: choice
         default: status
         options:
           - status
+          - ping
           - suspend
           - resume
 
@@ -28,9 +31,9 @@ concurrency:
 jobs:
   manage-render-services:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 5
     steps:
-      - name: Suspend at 1 AM IST, resume at 5 AM IST, or test status
+      - name: Run the scheduled operation
         shell: bash
         env:
           RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
@@ -40,21 +43,20 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ -z "${RENDER_API_KEY:-}" ]]; then
-            echo "::error::Missing repository Actions secret RENDER_API_KEY."
-            echo "Add it under Settings > Secrets and variables > Actions, then run this workflow manually with action=status."
-            exit 1
-          fi
-
           SERVICE_IDS=(
             "srv-d8al8hf7f7vs73d92p9g"  # OMDBMovieExplorer
             "srv-d82r34g3kofs73d3ib1g"  # Yatharth-FoodFinder
+          )
+          SERVICE_URLS=(
+            "https://omdbmovieexplorer.onrender.com/"
+            "https://yatharth-foodfinder.onrender.com/"
           )
 
           if [[ "$EVENT_NAME" == "schedule" ]]; then
             case "$EVENT_SCHEDULE" in
               "30 19 * * *") ACTION="suspend" ;;
               "30 23 * * *") ACTION="resume" ;;
+              "7,37 * * * *") ACTION="ping" ;;
               *)
                 echo "::error::Unexpected scheduled time: $EVENT_SCHEDULE"
                 exit 1
@@ -65,6 +67,38 @@ jobs:
           fi
 
           echo "Requested operation: $ACTION"
+
+          # Pings don't need an API key. They simply send inbound HTTP traffic to Render.
+          # At these UTC cron times, the local IST minutes are :07 and :37.
+          if [[ "$ACTION" == "ping" ]]; then
+            local_hour="$(TZ=Asia/Kolkata date +%H)"
+            local_hour_num=$((10#$local_hour))
+            if (( local_hour_num >= 1 && local_hour_num < 5 )); then
+              echo "Skipping pings during the overnight 1 AM-5 AM IST window (current IST hour: $local_hour)."
+              exit 0
+            fi
+
+            failed=0
+            for url in "${SERVICE_URLS[@]}"; do
+              http_code="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+                --connect-timeout 15 --max-time 120 "$url" || true)"
+              echo "Ping $url returned HTTP $http_code."
+              if [[ "$http_code" == "000" ]]; then
+                failed=1
+              fi
+            done
+            if [[ "$failed" -ne 0 ]]; then
+              echo "::error::At least one ping failed before receiving an HTTP response."
+              exit 1
+            fi
+            exit 0
+          fi
+
+          if [[ -z "${RENDER_API_KEY:-}" ]]; then
+            echo "::error::Missing repository Actions secret RENDER_API_KEY."
+            echo "Add it under Settings > Secrets and variables > Actions, then run this workflow manually with action=status."
+            exit 1
+          fi
 
           if [[ "$ACTION" == "status" ]]; then
             for id in "${SERVICE_IDS[@]}"; do
@@ -85,14 +119,53 @@ jobs:
             exit 1
           fi
 
-          ROLLBACK_ACTION="suspend"
           if [[ "$ACTION" == "suspend" ]]; then
+            TARGET_STATE="suspended"
             ROLLBACK_ACTION="resume"
+          else
+            TARGET_STATE="not_suspended"
+            ROLLBACK_ACTION="suspend"
+          fi
+
+          # Preflight both services first; don't partially change the pair on a read failure.
+          declare -A current_states
+          needs_change=()
+          failed=0
+          for id in "${SERVICE_IDS[@]}"; do
+            body="$(curl --fail --silent --show-error \
+              --header "Authorization: Bearer $RENDER_API_KEY" \
+              --header "Accept: application/json" \
+              "https://api.render.com/v1/services/$id")" || {
+                echo "::error::Could not retrieve current state for $id."
+                failed=1
+                continue
+              }
+            state="$(jq -r '.suspended // .service.suspended // empty' <<< "$body")"
+            if [[ "$state" != "suspended" && "$state" != "not_suspended" ]]; then
+              echo "::error::Unexpected suspended state '$state' for $id."
+              failed=1
+              continue
+            fi
+            current_states["$id"]="$state"
+            if [[ "$state" != "$TARGET_STATE" ]]; then
+              needs_change+=("$id")
+            else
+              echo "$id is already in state $TARGET_STATE; skipping."
+            fi
+          done
+
+          if [[ "$failed" -ne 0 ]]; then
+            echo "::error::Preflight failed; no suspend/resume changes were made."
+            exit 1
+          fi
+          if [[ "${#needs_change[@]}" -eq 0 ]]; then
+            echo "Both services are already in the requested state."
+            exit 0
           fi
 
           changed=()
           failed=0
-          for id in "${SERVICE_IDS[@]}"; do
+          for id in "${needs_change[@]}"; do
             response_file="$(mktemp)"
             http_code="$(curl --silent --show-error \
               --output "$response_file" --write-out '%{http_code}' \
